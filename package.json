@@ -1,0 +1,14 @@
+{
+  "name": "product-catalog",
+  "version": "1.0.0",
+  "description": "Product Catalog App",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "bcrypt": "^5.1.1"
+  }
+}

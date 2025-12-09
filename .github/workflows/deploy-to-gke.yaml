@@ -1,0 +1,282 @@
+# ⚠️  DO NOT MODIFY THIS FILE ⚠️
+# This workflow is pre-configured for your organization
+# All settings are already configured - just copy this file as-is
+# 
+# ✅ What's already configured:
+#    - GCP Project: app-sandbox-factory
+#    - Region: Dammam (me-central2)
+#    - Cluster: app-factory-prod
+#    - Authentication: Workload Identity Federation (automatic!)
+#
+# 🚀 You just need to: git push origin main
+# 
+# ❌ DO NOT:
+#    - Add GitHub secrets (NOT NEEDED - authentication is automatic!)
+#    - Modify GCP_PROJECT_ID, GCP_REGION, or GKE_CLUSTER
+#    - Change the workflow structure
+
+name: Deploy to GKE
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: app-sandbox-factory
+  GCP_REGION: me-central2
+  GKE_CLUSTER: app-factory-prod
+  REGISTRY: me-central2-docker.pkg.dev
+
+jobs:
+  deploy:
+    name: Build and Deploy to GKE
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: 'projects/621571041797/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+        service_account: 'github-actions@app-sandbox-factory.iam.gserviceaccount.com'
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Install gke-gcloud-auth-plugin
+      run: |
+        gcloud components install gke-gcloud-auth-plugin --quiet
+
+    - name: Configure Docker for Artifact Registry
+      run: gcloud auth configure-docker ${{ env.REGISTRY }}
+
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
+          --region=${{ env.GCP_REGION }} \
+          --project=${{ env.GCP_PROJECT_ID }}
+
+    - name: Generate app name from repo
+      id: app-name
+      run: |
+        APP_NAME=$(echo ${{ github.repository }} | sed 's/.*\///' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g')
+        echo "APP_NAME=$APP_NAME" >> $GITHUB_OUTPUT
+        echo "Deploying: $APP_NAME"
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }} .
+        docker tag ${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }} \
+          ${{ env.REGISTRY }}/${{ env.GCP_PROJECT_ID }}/app-factory/${{ steps.app-name.outputs.APP_NAME }}:latest
+        docker tag ${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }} \
+          ${{ env.REGISTRY }}/${{ env.GCP_PROJECT_ID }}/app-factory/${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }}
+
+    - name: Push to Artifact Registry
+      run: |
+        docker push ${{ env.REGISTRY }}/${{ env.GCP_PROJECT_ID }}/app-factory/${{ steps.app-name.outputs.APP_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.GCP_PROJECT_ID }}/app-factory/${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }}
+
+    - name: Deploy to GKE
+      run: |
+        APP_NAME=${{ steps.app-name.outputs.APP_NAME }}
+        IMAGE_PATH=${{ env.REGISTRY }}/${{ env.GCP_PROJECT_ID }}/app-factory/${{ steps.app-name.outputs.APP_NAME }}:${{ github.sha }}
+        
+        # Create Kubernetes manifests
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${APP_NAME}
+          labels:
+            app: ${APP_NAME}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: ${APP_NAME}
+          template:
+            metadata:
+              labels:
+                app: ${APP_NAME}
+            spec:
+              containers:
+              - name: app
+                image: ${IMAGE_PATH}
+                ports:
+                - containerPort: 8080
+                env:
+                - name: DATABASE_URL
+                  value: "postgresql://appuser:apppass@${APP_NAME}-db:5432/appdb"
+                - name: PORT
+                  value: "8080"
+                livenessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /health
+                    port: 8080
+                  initialDelaySeconds: 10
+                  periodSeconds: 5
+              - name: nginx-ssl
+                image: nginx:alpine
+                ports:
+                - containerPort: 8443
+                volumeMounts:
+                - name: nginx-config
+                  mountPath: /etc/nginx/nginx.conf
+                  subPath: nginx.conf
+                - name: ssl-cert
+                  mountPath: /etc/nginx/ssl
+                  readOnly: true
+              volumes:
+              - name: nginx-config
+                configMap:
+                  name: ${APP_NAME}-nginx-config
+              - name: ssl-cert
+                secret:
+                  secretName: cloudflare-origin-cert
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${APP_NAME}-nginx-config
+        data:
+          nginx.conf: |
+            events {
+              worker_connections 1024;
+            }
+            http {
+              server {
+                listen 8443 ssl;
+                server_name _;
+                
+                ssl_certificate /etc/nginx/ssl/tls.crt;
+                ssl_certificate_key /etc/nginx/ssl/tls.key;
+                ssl_protocols TLSv1.2 TLSv1.3;
+                
+                location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                }
+              }
+            }
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${APP_NAME}
+        spec:
+          type: LoadBalancer
+          ports:
+          - port: 443
+            targetPort: 8443
+            protocol: TCP
+            name: https
+          - port: 80
+            targetPort: 8443
+            protocol: TCP
+            name: http
+          selector:
+            app: ${APP_NAME}
+        ---
+        apiVersion: apps/v1
+        kind: StatefulSet
+        metadata:
+          name: ${APP_NAME}-db
+        spec:
+          serviceName: ${APP_NAME}-db
+          replicas: 1
+          selector:
+            matchLabels:
+              app: ${APP_NAME}-db
+          template:
+            metadata:
+              labels:
+                app: ${APP_NAME}-db
+            spec:
+              containers:
+              - name: postgres
+                image: postgres:16-alpine
+                ports:
+                - containerPort: 5432
+                env:
+                - name: POSTGRES_DB
+                  value: appdb
+                - name: POSTGRES_USER
+                  value: appuser
+                - name: POSTGRES_PASSWORD
+                  value: apppass
+                volumeMounts:
+                - name: data
+                  mountPath: /var/lib/postgresql/data
+                  subPath: postgres
+          volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 10Gi
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${APP_NAME}-db
+        spec:
+          clusterIP: None
+          ports:
+          - port: 5432
+          selector:
+            app: ${APP_NAME}-db
+        EOF
+
+    - name: Wait for deployment
+      run: |
+        kubectl rollout status deployment/${{ steps.app-name.outputs.APP_NAME }} --timeout=10m
+
+    - name: Get LoadBalancer IP
+      id: get-ip
+      run: |
+        echo "Waiting for LoadBalancer IP..."
+        for i in {1..60}; do
+          EXTERNAL_IP=$(kubectl get service ${{ steps.app-name.outputs.APP_NAME }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+          if [ ! -z "$EXTERNAL_IP" ]; then
+            echo "EXTERNAL_IP=$EXTERNAL_IP" >> $GITHUB_OUTPUT
+            echo "✅ App deployed at: http://$EXTERNAL_IP"
+            break
+          fi
+          echo "Still waiting... ($i/60)"
+          sleep 5
+        done
+        
+        if [ -z "$EXTERNAL_IP" ]; then
+          echo "⏳ LoadBalancer IP not ready yet. Check later with: kubectl get service ${{ steps.app-name.outputs.APP_NAME }}"
+        fi
+
+    - name: Comment on commit
+      if: steps.get-ip.outputs.EXTERNAL_IP != ''
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.repos.createCommitComment({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            commit_sha: context.sha,
+            body: `🚀 **Deployment Successful!**\n\n✅ Your app is live at: http://${{ steps.get-ip.outputs.EXTERNAL_IP }}\n\nDeployed from commit: ${context.sha.substring(0, 7)}`
+          })
